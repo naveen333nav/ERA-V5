@@ -6,3 +6,4 @@ My assignments for the ERA V5 course at The School of AI, one folder per session
 |---|---|---|
 | [assignment-10](assignment-10) | 10 | The Training Loop |
 | [assignment-11](assignment-11) | 11 | Optimizers and Learning-Rate Schedules |
+| [assignment-12](assignment-12) | 12 | Distributed Training I: Data Parallel and ZeRO |
