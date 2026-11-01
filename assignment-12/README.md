@@ -19,7 +19,7 @@ below is copied from the executed notebook.
   the text kept), 13.3M tokens. Every step draws the same 64 sequences of 128 tokens on every rank; rank r takes its
   share, so 1 rank and 32 ranks see exactly the same data.
 - **Hardware:** Colab A100 runtime, used for its 12 vCPUs and 167 GiB of RAM (the GPU is not used by the 32 ranks).
-  PyTorch 2.11. The whole notebook runs in 18.2 minutes and releases the runtime at the end.
+  PyTorch 2.11. The whole notebook runs in 17.6 minutes and releases the runtime at the end.
 
 Notebook: [`session12_zero.ipynb`](session12_zero.ipynb), executed top to bottom with every output saved.
 
@@ -35,8 +35,8 @@ Notebook: [`session12_zero.ipynb`](session12_zero.ipynb), executed top to bottom
 | Peak inside a step | 81.04 · 22.16 · **16.35** · **6.53** MiB (one unit's full buffers on top) |
 | Bytes sent per rank per step | DDP **1.9375 P** · ZeRO-1 **1.9375 P** · ZeRO-2 **1.9375 P** · ZeRO-3 **2.9063 P** |
 | Weights each rank's optimizer updates | DDP 5,310,720 (100%) · every ZeRO stage **165,960 (3.125%)** |
-| Optimizer time per rank | DDP 343 ms → ZeRO-1 **4.4 ms (78× less)** |
-| Forward + backward compute per rank | unchanged by ZeRO (one core per rank: 48–51 GFLOP/s in every stage) |
+| Optimizer time per rank | DDP 325 ms → ZeRO-1 **4.3 ms (75× less)** |
+| Forward + backward compute per rank | unchanged by ZeRO (one core per rank: 49–52 GFLOP/s in every stage) |
 | Same weights as one GPU after 4 steps (fp64) | max difference **1.3e-14** for every stage (updates were 3.0e-3) |
 | The four stages against each other | **bit-identical** weights and losses |
 | Lesson's table in real bf16 bytes, W = 8 | **16.0000 · 5.5000 · 3.7500 · 2.0000** bytes per weight; 1.75 P / 2.625 P sent |
@@ -44,7 +44,7 @@ Notebook: [`session12_zero.ipynb`](session12_zero.ipynb), executed top to bottom
 | Bug: DDP without averaging | replicas drift by **6.0e-4 = 2η** after step 1, 5.6e-2 after 20 |
 | Bug: ZeRO-1 without the weight all-gather | loss **7.96 vs 5.90** after 20 steps |
 | Bug: gradients summed, not averaged | loss changes by only 4.2e-4 under Adam (clipping off), **1.5e-2** with clipping |
-| One node, 8 ranks, one core each | communication / compute **30–39%** (vs 46–156% at W = 32 on the same 12 cores) |
+| One node, 8 ranks, one core each | communication / compute **29–39%** (vs 48–152% at W = 32 on the same 12 cores) |
 | Capstone projection, 30B, 8 × B200 | fits under ZeRO-1/2/3, communication **0.5–0.7%** of the step, about **87 days per 300B tokens** |
 
 ## 1. Thirty-two virtual GPUs
@@ -78,8 +78,8 @@ The time follows $t(n) = 2(W-1)\,\alpha + 2\frac{W-1}{W}\,n/\beta$:
 
 ![all-reduce time](ring_allreduce_time.png)
 
-The fit gives $\alpha$ = 659 µs per send and $\beta$ = 0.36 GB/s: every all-reduce on 32 ranks costs at least 41 ms,
-flat up to about 512 KiB, and only above 7.2 MiB does bandwidth dominate. Those are poor numbers (32 processes take
+The fit gives $\alpha$ = 653 µs per send and $\beta$ = 0.35 GB/s: every all-reduce on 32 ranks costs at least 41 ms,
+flat up to about 512 KiB, and only above 7.0 MiB does bandwidth dominate. Those are poor numbers (32 processes take
 turns on 12 cores, so a rank often waits for its neighbour to be scheduled), but the shape is the real one, and it is
 the reason for gradient **buckets**: sending the 31 weight tensors one at a time would cost 31 × 41 ms = 1.3 s of
 latency alone, 6 unit-sized buckets cost 0.25 s.
@@ -160,9 +160,9 @@ Right: time per step, left bars as implemented, hatched bars with every stage ch
 | activations kept for backward (MiB) | 29.03 | 29.03 | 29.03 | 5.25 |
 | bytes sent per step | 1.9375 P | 1.9375 P | 1.9375 P | 2.9063 P |
 | weights updated per rank | 5,310,720 | 165,960 | 165,960 | 165,960 |
-| optimizer compute (ms) | 342.6 | 4.4 | 4.5 | 3.5 |
-| communication incl. waiting (ms) | 473 | 484 | 573 | 862 |
-| step (ms) | 1,327 | 984 | 1,030 | 1,448 |
+| optimizer compute (ms) | 325.4 | 4.3 | 4.2 | 3.3 |
+| communication incl. waiting (ms) | 450 | 492 | 566 | 843 |
+| step (ms) | 1,275 | 973 | 1,014 | 1,411 |
 
 What the numbers say:
 
@@ -173,14 +173,14 @@ What the numbers say:
   checkpointing; 5.25 MiB in every stage with it). For ZeRO-3 the activations are twice the training state, which is
   why ZeRO-3 almost always comes with checkpointing.
 - **Computation:** forward and backward are unchanged by ZeRO. Every rank still runs the whole model on its own
-  sequences. The optimizer is the part that shrinks: 78 times less time for 32 times fewer weights (the extra factor
+  sequences. The optimizer is the part that shrinks: 75 times less time for 32 times fewer weights (the extra factor
   is cache: a 166k-weight slice fits, 5.3M weights × 5 tensors on 32 processes do not). On this CPU that made ZeRO-1's
-  step 26% *faster* than DDP's.
-- **Communication time** for ZeRO-3 is 1.86 times DDP's for 1.5 times the bytes: it makes 19 collectives per step
-  instead of 6, and every ring round pays the 0.66 ms latency.
-- One measurement looks like an effect but is not: checkpointed ZeRO-3's compute came out at 0.82 × DDP's. A ZeRO-3
-  rank spends 860 ms per step waiting in collectives, which frees cores for the other processes, so its compute runs
-  faster. With one core per rank (Section 11 below) the forward time is 184–200 ms in every stage.
+  step 24% *faster* than DDP's.
+- **Communication time** for ZeRO-3 is 1.79 times DDP's for 1.5 times the bytes: it makes 19 collectives per step
+  instead of 6, and every ring round pays the 0.65 ms latency.
+- One measurement looks like an effect but is not: checkpointed ZeRO-3's compute came out at 0.85 × DDP's. A ZeRO-3
+  rank spends about 840 ms per step waiting in collectives, which frees cores for the other processes, so its compute runs
+  faster. With one core per rank (Section 11 below) the forward time is 181–200 ms in every stage.
 
 ## 8. The lesson's table in real bytes (bf16, 8 ranks)
 
@@ -200,15 +200,14 @@ stages) was within 4e-4 of fp64.
 - **Bytes per rank** saturate at $2\frac{W-1}{W}P$ and $3\frac{W-1}{W}P$: 0, 1.0, 1.5, 1.75, 1.875, 1.9375 P and 0,
   1.5, 2.25, 2.625, 2.8125, 2.906 P. **In the middle plot DDP and ZeRO-1 are drawn but hidden under ZeRO-2:** the
   three send identical bytes (1.9375 P against 1.93752 P at W = 32, the difference being the 496-byte gradient-norm
-  all-reduce). The notebook's plotting code now draws the three with different marker sizes; the saved image is from
-  the run before that change.
-- **Compute per rank** fell close to $1/W$ (3,500 → 1,774 → 908 → 553 ms for W = 1, 2, 4, 8) and then stopped
-  (493 ms at 16, 520 at 32) because the machine has 12 cores. **DDP's optimizer got slower with W** (52 → 339 ms, the
+  all-reduce). The plot draws them as a large hollow circle, a diamond and a small dot so all three stay visible.
+- **Compute per rank** fell close to $1/W$ (3,401 → 1,737 → 887 → 533 ms for W = 1, 2, 4, 8) and then stopped
+  (497 ms at 16, 514 at 32) because the machine has 12 cores. **DDP's optimizer got slower with W** (49 → 310 ms, the
   same update on more processes competing for memory) while ZeRO's fell (53 → 3.5 ms).
-- **Communication overtakes compute as W grows:** ZeRO-3's communication time rose from 60 ms (W = 2) to 899 ms
+- **Communication overtakes compute as W grows:** ZeRO-3's communication time rose from 32 ms (W = 2) to 856 ms
   (W = 32) while its compute fell, crossing between W = 16 and 32. That is the lesson's point that faster GPUs make
   communication matter more, reproduced here by shrinking each GPU's share of the work instead. (In the right plot,
-  ZeRO-3's communication is exactly 0 at W = 1, which a log axis cannot show, so the dotted line drops off the bottom.)
+  ZeRO-3's communication line starts at W = 2: at W = 1 it is exactly 0, which a log axis cannot show.)
 
 ## 10. Training for real
 
@@ -231,9 +230,9 @@ a core" artefact:
 
 ![one node vs 32 ranks](single_node_8_vs_32.png)
 
-- Compute is the same in every stage: forward 184–200 ms and **48–51 GFLOP/s per core** for DDP, ZeRO-1, ZeRO-2 and
+- Compute is the same in every stage: forward 181–200 ms and **49–52 GFLOP/s per core** for DDP, ZeRO-1, ZeRO-2 and
   ZeRO-3. Without checkpointing only ZeRO-3 pays its recomputation (+30% forward + backward; predicted +33%).
-- Communication / compute is **30–39%** on the 8-rank node against **46–156%** for 32 ranks on the same 12 cores:
+- Communication / compute is **29–39%** on the 8-rank node against **48–152%** for 32 ranks on the same 12 cores:
   about the same bytes per rank, but 4 times the work to hide them behind, and no waiting for a core.
 
 **What this means for the capstone (a projection, assumptions in the notebook):** the 30B model's 447 GiB does not
@@ -288,8 +287,8 @@ compute of a 1M-token step.
 ## Limits of this work
 
 - **Virtual GPUs are CPU processes.** Memory and bytes are exact. Times are not GPU times: on 32 processes and 12
-  cores "communication" includes waiting for a core (latency 659 µs per send vs a few µs on NVLink, bandwidth
-  0.36 GB/s vs 50–900 GB/s). Only ratios and trends are meaningful; the 8 pinned ranks are the most reliable, and even
+  cores "communication" includes waiting for a core (latency 653 µs per send vs a few µs on NVLink, bandwidth
+  0.35 GB/s vs 50–900 GB/s). Only ratios and trends are meaningful; the 8 pinned ranks are the most reliable, and even
   they may share physical cores through hyperthreading.
 - **Precision:** fp64 for the equivalence tests, fp32 for timings, memory read in the lesson's recipe bytes from exact
   element counts; only the 8-rank bf16 run holds real bf16 tensors (3 steps).
