@@ -1,274 +1,324 @@
-# Assignment 11 — Optimizers and Learning-Rate Schedules, Measured
+# Assignment 11: Optimizers and Learning-Rate Schedules
 
-A gradient tells each weight which way to move, but not how far. Session 11 is about the rules for the distance:
-Adam, bias correction, warmup, schedules and learning-rate transfer across widths. This assignment checks each rule on
-a real model and real data. Every claim is predicted by hand first and then measured, and every comparison is tuned
-on both sides.
+A gradient tells a weight which way to move, but not how far. An optimizer decides the distance. This assignment
+checks Adam, bias correction, warmup, learning-rate schedules and learning-rate transfer across model widths on a
+real model trained on real text. Each result is predicted by hand first and then measured.
 
-- **Model:** the Llama-style decoder from Assignment 10, written from scratch ([`model.py`](model.py): RMSNorm, RoPE,
-  SwiGLU). The head is now a separate matrix so that muP can treat it differently. Default 49.3M weights
-  (L=6, D=384); width sweep at D = 256, 512, 1024 with 4 layers (29M to 154M weights).
-- **Data:** TinyStories, 40,000 stories, GPT-2 BPE, packed into one 9.0M-token stream (5% held out). Batches are
-  32 × 256 = 8,192 tokens; held-out loss is measured on the same 65,536 tokens every time.
-- **Loop:** AdamW (and a hand-written `HandAdamW` with a bias-correction switch), bf16 autocast, gradient clipping
-  at 1.0, 300-step runs. The same seed means the same initial weights and the same batches, so compared runs differ
-  only in the thing being compared.
-- **Hardware:** Google Colab Pro, NVIDIA A100-SXM4-40GB, PyTorch 2.11. The whole notebook (about 85 training runs)
-  takes 21.5 minutes.
+| | |
+|---|---|
+| Model | Llama-style decoder written from scratch ([`model.py`](model.py)), 49.3M weights (6 layers, width 384). Width sweep: 4 layers at widths 256, 512, 1,024 |
+| Data | TinyStories, 40,000 stories, GPT-2 tokens (9.0M tokens, 5% held out for evaluation) |
+| Training | AdamW, 300 steps of 8,192 tokens each. Runs with the same seed start from the same weights and see the same batches, so compared runs differ only in the setting being tested |
+| Hardware | Colab Pro, NVIDIA A100 40 GB. The full notebook (about 85 training runs) takes 22 minutes |
 
-Notebook: [`session11_optimizers.ipynb`](session11_optimizers.ipynb). It runs top to bottom with every output saved.
-Every number below is copied from that run.
+Notebook: [`session11_optimizers.ipynb`](session11_optimizers.ipynb), executed with all outputs saved. Every number
+below comes from that run. "Loss" means held-out loss (lower is better).
 
 ## Results
 
 | Task | Result |
 |---|---|
-| 1. Adam by hand vs PyTorch, lesson's 5 steps | identical $w$ in float64 (difference 0), $\le 3.1\times10^{-8}$ in float32 |
-| 1. Same check on a real 442,368-weight matrix, real gradients | max difference $1.49\times10^{-8}$ (one float32 spacing) vs steps of $10^{-3}$ |
-| 2. Bias correction off: uncorrected / corrected step ($\beta_2 = 0.999$) | 3.16 at step 1, **6.57 at step 12**, 6.24 at step 20 |
-| 2. Steps until the difference stops mattering (within 1%) | **3,925** for $\beta_2 = 0.999$ · **76** for $\beta_2 = 0.95$ (real model: within noise from step 63) |
-| 2. Real model, 300 steps, $\beta_2 = 0.999$, held-out loss | corrected 3.231 · **uncorrected 4.211 (+0.98)** · with warmup 100 still +0.67 |
-| 3. Update/weight ratio at step 1 (no warmup), hidden matrices | predicted $\eta/\sigma$ = 0.01960, measured 0.01957: the lesson's "19× too large" |
-| 3. Step at which warmup stops changing the ratio | about **step 113 to 131** for warmup 50 and 100 alike (embedding: right after warmup; `mlp.down`, head: never in 300 steps) |
-| 4. Cosine vs WSD, planned 300, stopped at 200 (3 seeds) | cosine 3.863 ± 0.044 · **WSD 3.702 ± 0.035**, paired gap −0.161 ± 0.014 |
-| 4. Model kept | **the WSD step-200 checkpoint** (lower loss, and it can continue or be decayed later) |
-| 5. SP optimal learning rate at widths 256 / 512 / 1024 | $1.91\times10^{-3}$ / $7.60\times10^{-4}$ / $4.16\times10^{-4}$, fitted exponent **−1.10** (theory −1) |
-| 5. Value for width 4,096 | **$1\times10^{-4}$**, low to moderate confidence (factor 2 either way, for 300-step runs) |
-| 5. muP sweep: spread of the optimum across widths | **1.9×** (SP: 4.6×) |
-| Extra: Adam step for noisy gradients | 0.183 η at steady state (lesson: 0.281 η, not reproduced) |
-| Extra: L2 vs AdamW decay, small-gradient weight vs large | L2 **17×** stronger (lesson: 100×), AdamW 1.00× |
-| Extra: AdamW memory, measured | 4 + 4 + 8 = **16 bytes per weight**; 9B model 134.1 GiB, the lesson's figure |
+| 1. Adam by hand vs PyTorch | Same weights to the last digit in float64; differences below $3\times10^{-8}$ in float32 |
+| 2. Bias correction switched off | Steps are 3.2× too large at step 1 and 6.6× at step 12. They match the corrected steps within 1% only after **3,925 steps** (β₂ = 0.999), or **76 steps** (β₂ = 0.95) |
+| 3. Update-to-weight ratio under warmup | Warmup stops changing the ratio at about **step 115 to 130**, for both a 50-step and a 100-step warmup |
+| 4. Cosine vs WSD, stopped at step 200 | Cosine 3.863, **WSD 3.702** (3 seeds). **Keep the WSD model** |
+| 5. Best learning rate at widths 256 / 512 / 1,024 | 1.9e-3 / 7.6e-4 / 4.2e-4. For width 4,096: **1e-4**, low to moderate confidence |
 
-## Task 1 — Adam by hand
+---
 
-Adam keeps two running averages per weight, $m$ for the gradient and $v$ for its square, corrects their start-at-zero
-bias and steps by their ratio:
+## Task 1: Adam by hand
 
-$$m \leftarrow \beta_1 m + (1-\beta_1) g,\quad v \leftarrow \beta_2 v + (1-\beta_2) g^2,\quad
-\hat m = \frac{m}{1-\beta_1^t},\ \hat v = \frac{v}{1-\beta_2^t},\quad w \leftarrow w - \eta\frac{\hat m}{\sqrt{\hat v}+\epsilon}$$
+**What Adam does.** It keeps two running averages for every weight and steps by their ratio:
 
-By hand, step 1 of the lesson's example ($w_0 = 1$, $g = 0.5$, $\eta = 10^{-3}$): $m = 0.05$, $v = 0.00025$,
-$\hat m = 0.5$, $\hat v = 0.25$, step $= -0.001$, so the first step is exactly $-\eta\,\text{sign}(g)$. The
-plain-Python version reproduces the lesson's five-step table to six decimals (0.999000 … 0.995031). Every step is
-within 1.19% of $\eta$ even though the gradients vary by 50%.
+$$w \leftarrow w - \eta \cdot \frac{\hat m}{\sqrt{\hat v} + \epsilon}$$
 
-| check | max \|hand − PyTorch\| in $w$ |
+- $\eta$ is the learning rate (here 0.001).
+- $m$ is the running average of the gradient. It remembers about the last 10 gradients, set by $\beta_1 = 0.9$.
+- $v$ is the running average of the gradient squared, so $\sqrt v$ is the typical size of this weight's gradient.
+  It remembers about the last 1,000 gradients, set by $\beta_2 = 0.999$.
+- $\hat m$ and $\hat v$ are the same averages after **bias correction**. Both averages start at 0 and read too low
+  for the first steps. Dividing them by $(1-\beta^t)$ fixes that exactly.
+- $\epsilon = 10^{-8}$ is there only to avoid dividing by zero.
+
+**Step 1 by hand** (start at $w = 1$, first gradient 0.5): $m = 0.05$, $v = 0.00025$, $\hat m = 0.5$, $\hat v = 0.25$,
+so the step is $-0.001 \times 0.5 / 0.5 = -0.001$ and $w$ becomes 0.999.
+
+| Check | Largest difference from the hand calculation |
 |---|---:|
-| `torch.optim.Adam`, float64 | 0 |
-| `torch.optim.AdamW` (λ = 0.1), float64 | 0 |
-| `Adam` / `AdamW`, float32 | 1.3e-8 / 3.1e-8 (below one float32 spacing near 1, 1.19e-7) |
-| `HandAdamW` vs `AdamW` on the real `blocks.0.attn.qkv` (442,368 weights, 5 real gradients) | 1.49e-8 = $2^{-26}$ |
+| `torch.optim.Adam` and `AdamW`, float64, 5 steps | 0 |
+| Same, float32 | 1.3e-8 to 3.1e-8 (float32 rounding) |
+| A real 442,368-weight attention matrix, 5 real gradients | 1.5e-8, while each step moves a weight by about 1e-3 |
 
-On real gradients the first step was $-0.99975\,\eta$ rather than exactly $-\eta$. That weight's gradient is about
-$4\times10^{-5}$, so $\epsilon = 10^{-8}$ is no longer negligible. The mean step over the matrix falls from
-$9.99\times10^{-4}$ to $3.48\times10^{-4}$ within 5 steps: the gradients stop agreeing with each other almost at once.
+The five-step table from the lesson is reproduced to six decimals (w = 0.999000, 0.998012, 0.997018, 0.996028,
+0.995031).
 
-**Why "Adam moves every weight by about η" is only half true** ([plot](adam_step_vs_consistency.png)). The step
-depends on how consistent the gradient is, not on its size:
+### Why Adam's step is not always the learning rate
 
-| gradient sequence | predicted $\lvert\text{step}\rvert/\eta$ | measured (steady state) |
-|---|---:|---:|
-| constant | 1 | 1.000 |
-| alternating ±1 | $(1-\beta_1)/(1+\beta_1) = 0.053$ | 0.053 |
-| noise, mean 0 | $\sqrt{0.1/1.9}\sqrt{2/\pi} = 0.183$ | 0.183 |
+The lesson says Adam moves every weight by about $\eta$. Half of that is true: **the size of the gradient does not
+matter.** Dividing by $\sqrt v$ cancels it, so a weight with gradients of 0.5 and a weight with gradients of 0.0005
+take the same step.
 
-The lesson quotes 0.281 η for the noisy case. Averaged over the first 10 / 100 steps we get 0.448 / 0.216, so its
-number depends on an averaging window it does not state.
+The other half needs a condition: **the step is close to $\eta$ only if the gradient keeps pointing the same way.**
+$m$ averages the gradients *with their signs*, so gradients that flip sign cancel inside $m$. $v$ averages squares,
+which are always positive, so they never cancel. The result is a small $m$ divided by an unchanged $\sqrt v$: a small
+step.
 
-**L2 vs decoupled decay.** With noisy gradients (std 1 for weight A, 0.01 for weight B), AdamW shrinks both by
-$4.93\times10^{-5}$ per step ($=\eta\lambda w$). L2 shrinks B by $8.37\times10^{-4}$ and A by $4.90\times10^{-5}$:
-**17 times more, not the lesson's 100.** B's decay term ($\lambda w = 0.05$) is larger than its gradient noise, so it
-takes over both $\hat m$ and $\hat v$, and Adam can never move a weight much more than $\eta$.
+To show this, we fed three made-up gradient patterns to Adam, each to 10,000 weights. The table gives the average
+step size once Adam has settled, as a fraction of $\eta$ (1.0 means a full step of 0.001):
 
-**Memory.** Measured on the GPU: weight 4 + gradient 4 + AdamW state 8 = 16 bytes per weight (SGD + momentum 12,
-SGD 8). For 9B weights that is 134.1 / 100.6 / 67.1 GiB, the lesson's table exactly. Half the AdamW bill is $m$ and $v$.
+| Gradient pattern | Example | What happens inside Adam | Step / η |
+|---|---|---|---:|
+| Always the same | 0.5, 0.5, 0.5, … | $m$ = 0.5 and $\sqrt v$ = 0.5, ratio 1 | **1.000** |
+| Flips every step | +1, −1, +1, −1, … | $m$ only reaches ±0.053, $\sqrt v$ = 1 | **0.053** |
+| Random, average zero | noise of size 1 | $m$ is mostly cancelled noise, $\sqrt v$ = 1 | **0.183** |
 
-## Task 2 — Bias correction switched off
+All three match the hand predictions. Real gradients sit between these patterns: the average step in the real
+attention matrix fell from 1.00 η at step 1 to 0.35 η at step 5, as its gradients quickly stopped agreeing.
 
-Without correction the update uses $m/\sqrt v$. Since $m = \hat m(1-\beta_1^t)$ and $v = \hat v(1-\beta_2^t)$:
+![step size vs gradient consistency](adam_step_vs_consistency.png)
 
-$$\frac{m}{\sqrt v} = \frac{\hat m}{\sqrt{\hat v}}\cdot c(t),\qquad c(t) = \frac{1-\beta_1^t}{\sqrt{1-\beta_2^t}}$$
+*Each line is one gradient pattern. Y-axis: average step size divided by η. X-axis: step number (log scale).*
 
-So the uncorrected step is the corrected one times a factor that depends **only on the step count**. "When does it
-stop mattering" becomes a question with an exact answer: when $c(t)$ is close to 1.
+The lesson gives 0.281 η for random gradients. We measure 0.183 once settled (0.448 averaged over the first 10
+steps, 0.216 over the first 100), so we could not reproduce that figure.
 
-![bias factor](bias_correction_factor.png)
+### Two smaller checks
 
-| $\beta_2$ | $c(1)$ | peak | $c(20)$ | within 10% from | within 1% from |
+| Check | Expected | Measured |
+|---|---|---|
+| Weight decay. Weight A has large gradients, weight B gradients 100× smaller. How much harder is B decayed? | Lesson: 100× with L2 regularization, 1× with AdamW | **17×** with L2, **1.00×** with AdamW |
+| Training memory per weight with AdamW | 16 bytes | 4 (weight) + 4 (gradient) + 8 (Adam's $m$ and $v$) = **16 bytes** |
+
+L2 decays B only 17× harder, not 100×, because Adam never moves a weight much more than $\eta$ per step, which caps
+the gap. The memory result means a 9B-parameter model needs 134 GiB just for these four numbers, and half of that is
+the optimizer's $m$ and $v$.
+
+---
+
+## Task 2: Bias correction switched off
+
+**What changes.** Without correction, Adam uses $m$ and $v$ directly. That multiplies every step by a factor that
+depends only on the step number $t$:
+
+$$c(t) = \frac{\text{step without correction}}{\text{step with correction}} = \frac{1-\beta_1^t}{\sqrt{1-\beta_2^t}}$$
+
+At step 1 with $\beta_1 = 0.9$ and $\beta_2 = 0.999$: $c = 0.1 / \sqrt{0.001} = 3.16$, so the first step is 3.16 times
+too large. $c(t) = 1$ means switching correction off makes no difference.
+
+**How "stops mattering" is measured.** "Within 1% from step N" means: from step N onward, the uncorrected step is
+always between 0.99 and 1.01 times the corrected step. Before step N it was outside that range at least once.
+"Within 10%" uses 0.90 to 1.10 instead.
+
+| β₂ | Factor at step 1 | Largest factor | Factor at step 20 | Within 10% from step | Within 1% from step |
 |---:|---:|---:|---:|---:|---:|
-| 0.999 | 3.162 | **6.569 at step 12** | 6.241 | 1,751 | **3,925** |
-| 0.99 | 1.000 | 2.131 at step 13 | 2.059 | 175 | 391 |
-| 0.95 | 0.447 | 1.097 at step 20 | 1.097 | 6 | **76** |
+| 0.999 (lesson default) | 3.16 | 6.57 (step 12) | 6.24 | 1,751 | **3,925** |
+| 0.99 | 1.00 | 2.13 (step 13) | 2.06 | 175 | 391 |
+| 0.95 (common for LLMs) | 0.45 | 1.10 (step 20) | 1.10 | 6 | **76** |
 
-With $\beta_2 = 0.999$ the uncorrected step does not just start too large: it *grows* to 6.6 times too large. $m$'s
-bias is gone after 44 steps, but $v$'s takes thousands. With $\beta_2 = 0.95$ the uncorrected first step is *smaller*,
-so missing correction acts like a tiny warmup.
+With β₂ = 0.999 the error does not shrink at first, it grows: steps become 6.6 times too large around step 12.
+$m$'s correction is done after about 44 steps, but $v$'s takes thousands, because $v$ has a much longer memory. With
+β₂ = 0.95 the first steps are *smaller* than they should be, which works like a short warmup.
 
-**The first 20 steps of two real weights** (their recorded gradients fed to both versions). The step ratio follows
-$c(t)$: 3.15 / 6.55 / 6.22 at steps 1 / 12 / 20 for one weight and 3.04 / 6.44 / 6.13 for the other, whose gradients
-are small enough ($10^{-7}$ to $10^{-5}$) for $\epsilon$ to matter. After 20 steps the uncorrected weight had moved
-**5.5 times further** (0.0588 vs 0.0106). With $\beta_2 = 0.95$ the two are almost the same (0.0102 vs 0.0114).
-Within 20 steps, with $\beta_2 = 0.999$, the difference never stops mattering.
+![correction factor](bias_correction_factor.png)
+
+*The factor c(t) for three values of β₂. The green band is "within 1%".*
+
+### The first 20 steps of two real weights
+
+We recorded 20 real gradients of two weights from the model and ran each sequence through Adam with and without
+correction. One weight had a fairly consistent gradient (top row), the other a noisy one (bottom row).
 
 ![first 20 steps](bias_correction_20_steps.png)
 
-**On the real model (300 steps, η = 1e-3).** I expected a loss spike; there was none, and the result went the other
-way at first. For about 25 steps the uncorrected run is *ahead*, by up to 1.5 nats near step 5, because larger steps
-help while the loss falls from 10.8. After step ~30 it falls behind for good:
+How to read the three panels in each row:
 
-| run | held-out loss at 300 | gap |
+| Panel | What it shows |
+|---|---|
+| Left: the 20 real gradients | the gradient this weight received at each step |
+| Middle: `|step| / lr` | how far the weight moved at that step, divided by the learning rate. 1 means it moved exactly 0.001; 4 means four times that. Direction is ignored |
+| Right: `weight position w_t − w_0` | where the weight is after t steps, measured from its starting value: the running total of all its steps, with direction |
+
+The red solid line (no correction, β₂ = 0.999) sits 3 to 6 times above the blue line in the middle panels, as the
+factor predicts. In the top-right panel that weight ends up **5.5 times further** from its start (0.059 vs 0.011).
+With β₂ = 0.95 (dashed lines) the two versions almost overlap. **Within these 20 steps the difference never stops
+mattering for β₂ = 0.999.**
+
+### On the real model (300 steps)
+
+| Run | Loss at step 300 | Gap |
 |---|---:|---:|
-| $\beta_2 = 0.999$, corrected / uncorrected | 3.231 / 4.211 | **+0.980** |
-| same, with 100-step warmup | 3.051 / 3.722 | +0.671 |
-| $\beta_2 = 0.95$, corrected / uncorrected | 3.243 / 3.266 | +0.024 (within noise from step 63) |
-| seed-to-seed, corrected | 3.231 / 3.249 | 0.018 |
+| β₂ = 0.999, with / without correction | 3.231 / 4.211 | **+0.98** |
+| Same, with a 100-step warmup | 3.051 / 3.722 | +0.67 |
+| β₂ = 0.95, with / without correction | 3.243 / 3.266 | +0.02 (seed-to-seed noise) |
+| Two seeds, both with correction (noise level) | 3.231 / 3.249 | 0.02 |
 
-$c(t)$ is still 3.24 at step 100 and 1.96 at step 300, so the uncorrected run trains at 2 to 6.6 times the intended
-rate the whole time. Warmup cannot fix that: it only scales the first 100 steps, while $c(t)$ stays above 2 until
-about step 290. In practice, bias correction matters because of $\beta_2 = 0.999$. With the $\beta_2 = 0.95$ common in
-LLM training, missing correction is harmless after about 76 steps.
+The uncorrected β₂ = 0.999 run is actually *ahead* for the first ~25 steps, since bigger steps help while the loss is
+still near its starting value of 10.8. After that it falls behind and stays behind, because its steps remain 2 to 6.6
+times too large for the whole run. Warmup does not fix this: warmup ends at step 100, but the factor stays above 2
+until about step 290. With β₂ = 0.95 switching correction off is harmless: the gap falls inside the noise from step
+63, close to the 76 steps predicted above.
 
 ![real model](bias_correction_real_model.png)
 
-## Task 3 — Update-to-weight ratio per layer, and warmup
+*Coloured lines: training loss with and without correction. Black line (right axis): the gap between them. Green
+band: the seed-to-seed noise.*
 
-$$r_t = \frac{\lVert W_t - W_{t-1}\rVert}{\lVert W_{t-1}\rVert} \approx \frac{\eta_t\,k_t}{\sigma}$$
+---
 
-Adam moves each element by about $\eta k$, where $k \le 1$ measures gradient consistency. A tensor of $n$ elements
-with spread $\sigma$ has $\lVert W\rVert = \sigma\sqrt n$, and the $\sqrt n$ cancels. So $r_t$ is the learning rate in
-units of the tensor's own scale. **During warmup $\eta_t$ forces it upward. After warmup only $k_t$ (and $\sigma$) move
-it.** The task's step is the hand-off between those two regimes.
+## Task 3: Update-to-weight ratio and warmup
 
-**Step 1, no warmup:** $k = 1$ exactly, so $r_1 = \eta/\sigma$. Predicted vs measured:
+**What the ratio is.** For one weight matrix, the update-to-weight ratio is the size of one step's change divided by
+the size of the matrix itself. 0.01 means one step changed the matrix by 1% of its size. The lesson's rule of thumb is
+that it should stay near 0.001.
 
-| tensor | σ | predicted | measured |
+**How warmup connects to it.** Adam moves each weight by about η × (gradient consistency), as Task 1 showed. So:
+
+$$\text{ratio} \approx \frac{\eta \times \text{consistency}}{\text{typical weight size}}$$
+
+During warmup η grows step by step, which pushes the ratio up. After warmup η is constant, and the ratio changes only
+when the gradients get less consistent or the weights grow. **"The step where warmup stops changing the ratio" is
+where the first effect gives way to the second.**
+
+**Check at step 1, no warmup.** At step 1 every weight moves by exactly η, so ratio = η / weight size:
+
+| Matrix | Weight size | Predicted | Measured |
 |---|---:|---:|---:|
-| attn.qkv / mlp.up / mlp.gate | 0.051 | 0.01960 | 0.01957 |
-| attn.proj | 0.0147 | 0.06783 | 0.06781 |
-| mlp.down | 0.0090 | 0.1108 | 0.1107 |
-| norm gains | 1 | 0.00100 | 0.00100 |
-| embedding (1,244 of 50,304 rows in the batch) | 0.02 | 0.00786 | 0.00785 |
-| head | 0.0026 | 0.384 | 0.381 |
+| attention qkv, MLP gate and up | 0.051 | 0.0196 | 0.0196 |
+| attention output | 0.015 | 0.068 | 0.068 |
+| MLP down | 0.009 | 0.111 | 0.111 |
+| norm gains | 1 | 0.001 | 0.001 |
+| output head | 0.0026 | 0.384 | 0.381 |
 
-That is the lesson's "nineteen times too large" first step (0.0196 vs the $10^{-3}$ rule). With warmup $W$, step 1 is
-$1/W$ of it: $3.9\times10^{-4}$ ($W = 50$), $1.9\times10^{-4}$ ($W = 100$).
+This is the lesson's "first step about 19 times too large" (0.0196 against the 0.001 rule). With a warmup of W steps,
+step 1 uses η/W, so the first ratio is W times smaller.
+
+**Result (warmup 0, 50 and 100 steps, constant rate afterwards):**
+
+| Matrix type | Warmup run matches the no-warmup run (within 10%) from step |
+|---|---|
+| attention qkv, MLP gate and up, norm gains | **113 to 131**, for both warmup 50 and 100 |
+| embedding | right after warmup ends (53 and 109) |
+| attention output | 122 (warmup 50), 264 (warmup 100) |
+| MLP down, output head | never within 300 steps: they stay 10–25% higher with warmup |
+
+So warmup stops changing the ratio at about **step 115 to 130** for most layers, and a 100-step warmup hands over at
+about the same point as a 50-step one. The two layers that never match start with the smallest weights. Without warmup
+their first steps were 11% and 38% of their own size, which made those weights permanently larger.
 
 ![ratio per layer](update_ratio_per_layer.png)
 
-Three runs, warmup 0 / 50 / 100, then constant $\eta$ (no decay, so nothing else moves the ratio):
-
-- **Warmup stops changing the ratio at about step 113 to 131** (first step after which the warmup run stays within
-  10% of the no-warmup run) for qkv, gate, up and norm gains, **for both warmup lengths**. For warmup 50 the ratio
-  also peaks right at the end of warmup (steps 52 to 58). The embedding rejoins immediately after warmup (53, 109).
-- **`mlp.down` and the head never rejoin within 300 steps.** They end 10 to 25% higher in the warmup runs. They have
-  the smallest initial scale, and without warmup their first steps were 11% and 38% of their own size, which
-  permanently enlarged $\lVert W\rVert$.
-- **$r_t/\eta_t$ (the part warmup does not set) falls from about 20 to about 4 by step 150 in every run.** Early
-  gradients agree and later ones do not. This is the reason warmup exists, measured directly. Without warmup the
-  ratio falls from $2\times10^{-2}$ to about $4\times10^{-3}$ in roughly 20 steps by itself.
-- Settled ratios at $\eta = 10^{-3}$: $3.5$ to $4\times10^{-3}$ (qkv, gate, up), $10^{-2}$ (proj), $1.3\times10^{-2}$
-  (down), $2\times10^{-4}$ (norm gains). That is 4 to 13 times the $10^{-3}$ rule, which is meant for long runs.
-- Warmup also helped the loss: 3.257 → 3.206 → **3.037** for warmup 0 → 50 → 100. Section 2 shows the same.
+*One panel per type of matrix. Colours: warmup 0 / 50 / 100. Dotted lines: end of warmup. Dashed line: the 0.001
+rule of thumb.*
 
 ![ratio vs warmup](update_ratio_vs_warmup.png)
 
-## Task 4 — Cosine vs WSD, stopped at step 200
+*Left: the learning rate. Middle: the ratio. Right: ratio ÷ learning rate, the part warmup does not control. It falls
+from about 20 to about 4 in all three runs: early gradients agree with each other, later ones do not. That is why
+warmup is needed.*
 
-Both planned for 300 steps (20 warmup). At step 200 cosine is at 0.355 of its peak, while WSD is still flat (decay
-over 241 to 300). The peak rate was tuned separately for each over {5e-4, 1e-3, 2e-3, 4e-3}; both chose 1e-3. Then 3
-seeds per configuration, plus three extra configurations at equal compute:
+The 100-step warmup also gave the best loss at step 300 (3.04, against 3.21 for warmup 50 and 3.26 for no warmup).
 
-| model | rate area to step 200 | held-out loss at 200 | at 300 |
-|---|---:|---:|---:|
-| cosine planned 300, stopped at 200 | 145 | 3.863 ± 0.044 | 3.580 ± 0.039 |
-| **WSD planned 300, stopped at 200** | 190 | **3.702 ± 0.035** | 3.248 ± 0.031 |
-| cosine planned for 200 | 109 | 4.164 ± 0.041 | — |
-| WSD branch: flat to 160, decay 160 to 200 | 172 | 3.762 ± 0.043 | — |
-| constant rate | 190 | 3.702 ± 0.035 | 3.238 ± 0.023 |
-| constant rate, EMA of weights (decay 0.9) | | 3.705 ± 0.038 | **3.205 ± 0.025** |
+---
 
-Paired by seed, WSD − cosine = **−0.161 ± 0.014** at step 200 (all three seeds negative) and −0.332 ± 0.010 at 300.
+## Task 4: Cosine vs WSD, stopped at step 200
 
-**I would keep the WSD model.** It has the lower loss, and it is a flat-phase checkpoint, so it can be trained
-further or decayed later. The cosine model is half-decayed from a run that was cut short.
+Both schedules are planned for 300 steps and stopped at step 200. **Cosine** lowers the learning rate smoothly from
+step 20, and at step 200 is at 36% of its peak. **WSD** (warmup, stable, decay) holds the peak until step 240 and
+decays only at the end, so at step 200 it is still at full rate. The peak rate was tuned separately for each schedule;
+both came out best at 0.001. Each setup ran with 3 seeds.
 
-**This contradicts my prediction**, which was that cosine's partial annealing would make it better at step 200. In
-this regime every decay cost loss, and the loss at step 200 is ordered exactly by how much learning rate each run has
-used. Even the "finished" WSD branch is worse than not decaying, and WSD's own decay over steps 240 to 300 gained
-nothing over a constant rate. After only 2.5M tokens the model is far from converged: the loss is still falling by
-0.25 nats per 50 steps. Progress is limited by how far the weights can travel, not by gradient noise, so decaying the
-rate hurts. The annealing drop the lesson describes needs a longer run. A short weight average (EMA 0.9) gave the best
-step-300 model. Longer averages (0.98) hurt, because the weights move fast.
+| Model | Loss at step 200 | Loss at step 300 |
+|---|---:|---:|
+| cosine, planned for 300 | 3.863 ± 0.044 | 3.580 |
+| **WSD, planned for 300** | **3.702 ± 0.035** | 3.248 |
+| *extra:* cosine planned for 200 (fully decayed at 200) | 4.164 | — |
+| *extra:* WSD decayed from step 160 to 200 | 3.762 | — |
+| *extra:* constant rate | 3.702 | 3.238 |
+| *extra:* constant rate, averaged weights (last ~10 steps) | 3.705 | **3.205** |
+
+**I would keep the WSD model.** It beats cosine on every seed, by 0.16 on average, and because it was saved during the
+flat phase it can still be trained further or decayed later. The cosine model is half-decayed from a run that was cut
+off.
+
+**This surprised me.** I expected cosine to win at step 200, because a lower learning rate usually lets the weights
+settle. Here every decay made the loss *worse*. After only 300 steps the model is far from trained: the loss still
+drops about 0.25 every 50 steps. At that stage progress depends on how far the weights can travel, so the run with
+the most learning rate so far wins at step 200. The benefit of decaying shows up in much longer runs.
 
 ![cosine vs WSD](cosine_vs_wsd.png)
 
-## Task 5 — Learning-rate sweep across widths
+*Left: loss over training (mean of 3 seeds). Middle: the learning rate each run used. Right: loss at step 200.*
 
-With Adam each element of a hidden matrix moves by about $\eta$ whatever the width. A layer's output sums $d$ such
-changes coherently, $\Delta y \approx d\,\eta\,|x|$, so in the standard parameterization (SP) $\eta^* \propto 1/d$.
-**muP** builds that $1/d$ into the model (hidden rate $\eta/m$, logits divided by $m$, $m = d/256$), so one $\eta$
-should be optimal at every width.
+---
 
-9 rates from 1e-4 to 5e-2, 300 steps, cosine with 30 warmup steps; minima located by a parabola in $\log\eta$:
+## Task 5: Learning-rate sweep across widths
 
-| width | SP $\eta^*$ | SP loss | muP $\eta^*$ | muP loss | seed std at the best point |
-|---:|---:|---:|---:|---:|---:|
-| 256 | 1.91e-3 | 3.457 | 1.91e-3 (same model) | 3.457 | 0.092 |
-| 512 | 7.60e-4 | 3.507 | 3.02e-3 | 3.553 | 0.082 |
-| 1024 | 4.16e-4 | 3.599 | 3.66e-3 | 3.642 | 0.081 |
+**Why the best learning rate depends on width.** Adam moves each weight by about η whatever the model's width. A
+layer's output adds up the contributions of all its inputs. With twice as many inputs, the same per-weight step
+changes the output about twice as much. So in the standard setup the best η should roughly halve each time the
+width doubles. **muP** is a way of setting up the model that builds this correction in, so that one η should be best
+at every width.
+
+Sweep: 9 learning rates from 1e-4 to 5e-2, 300 steps each, at three widths, in the standard setup and with muP.
+
+| Width | Best η (standard) | Best η (muP) | Seed-to-seed noise at the best point |
+|---:|---:|---:|---:|
+| 256 | 1.9e-3 | 1.9e-3 (same model) | 0.09 |
+| 512 | 7.6e-4 | 3.0e-3 | 0.08 |
+| 1,024 | 4.2e-4 | 3.7e-3 | 0.08 |
 
 ![LR sweep](lr_sweep_sp_vs_mup.png)
 
-**SP follows the theory.** Fitted law $\eta^* = 0.80\,d^{-1.10}$, against the theoretical exponent −1.
+*Loss against learning rate. Stars mark the best learning rate at each width. Left: standard setup. Right: muP.*
 
-**Value for width 4,096: $1\times10^{-4}$.** The fitted law gives $8.6\times10^{-5}$ and the −1 rule anchored at
-width 1,024 gives $1.04\times10^{-4}$. The lesson's table says $1.9\times10^{-4}$ for its own setting.
+**Standard setup:** the best η falls with width almost exactly as predicted. Fitting the three points gives
+η ∝ width^−1.10, against the expected width^−1.
 
-**Confidence: low to moderate. I would trust it to a factor of 2 (5e-5 to 2e-4) for a 300-step run.**
-- Seed noise at the optimum (0.08 to 0.09 nats) is as large as the gap between neighbouring grid points, so each
-  minimum is uncertain by about one grid step.
-- With 3 points and 2 fitted numbers the formal 95% interval is $1.6\times10^{-6}$ to $4.7\times10^{-3}$. The estimate
-  is believable mainly because the slope matches theory.
-- It is a 4× extrapolation, and short runs favour larger rates.
+**Value for width 4,096: 1e-4.** The fitted line gives 8.6e-5, and halving per doubling from width 1,024 gives
+1.0e-4.
 
-**muP:** the optimum's spread across widths drops from 4.6× (SP) to 1.9×. It is better but not perfect: the minima
-drift upwards by about 1.4× per doubling, within the noise of each minimum, and possibly also due to my minimal muP.
-It does not make the model better (losses within noise of SP), which is the lesson's point. **Cross-check:** if muP
-transfer holds, the hidden matrices at width 4,096 would get about $(2\text{ to }4)\times10^{-3}/16 =
-1.2\text{ to }2.3\times10^{-4}$, within a factor of 2 of the SP extrapolation.
+**Confidence: low to moderate. I trust it to within a factor of 2 (5e-5 to 2e-4).** Reasons:
+- The seed-to-seed noise (0.08) is as large as the difference between neighbouring learning rates, so each best value
+  is uncertain by about one grid step.
+- It is an extrapolation from 3 points to a width 4 times larger than any tested.
+- 300-step runs prefer larger learning rates than full-length runs, so the real value is probably lower.
+
+**muP:** the best η now varies only 1.9× across widths, against 4.6× in the standard setup. That is better but not
+perfect, and it did not lower the loss. muP's job is to make a small-model sweep valid for a large model, not to make
+the model better. If muP transfer holds, its width-4,096 estimate for the hidden layers is 1.2e-4 to 2.3e-4, close to
+the standard-setup answer.
 
 ![extrapolation](lr_extrapolation.png)
 
+*Best learning rate against width (log scales), the fitted line, and the extrapolation to 4,096 with its very wide
+95% interval.*
+
+---
+
 ## Limits of this work
 
-- **Short runs, small models.** 300 steps (2.5M tokens) on 29M to 154M weights, 67 to 89% of them embedding and head.
-  The loss is still falling fast at the end. The schedule result in Task 4 describes this undertrained regime and is
-  not a general ranking of cosine and WSD. Long-run effects (AdamW's $1/(\eta\lambda)$ averaging timescale) cannot
-  appear here.
-- **Few seeds, large noise.** Seed spread is 0.02 to 0.04 nats in Tasks 2 to 4 and 0.08 to 0.09 nats at the sweep
-  optima. Task 4 tunes the rate on one seed. Task 5 runs one seed per grid point plus 2 extra seeds at each optimum.
-- **Width 4,096 is extrapolated** from 3 points, 4 times beyond the widest model.
-- **Thresholds are my choices:** 1% / 10% for "stops mattering", a 10% agreement band for the warmup hand-off, loss
-  above 15 as "diverged" (at width 256, 2e-2 was stopped at a single spike while 5e-2 survived), three-point
-  parabolas for the minima.
-- **muP is minimal:** the embedding rate and weight decay are not rescaled with width; head width is fixed at 64.
-- **Not reproduced:** the lesson's 0.281 η noisy-gradient step and its 100× L2 gap. Both differences are explained
-  above, but I cannot tell what setting the lesson used.
+- **Short runs.** 300 steps on small models that are still far from trained. The schedule result in Task 4 holds for
+  this early stage only. It is not a general ranking of cosine and WSD.
+- **Noise.** Seed-to-seed differences are 0.02 to 0.04 (Tasks 2 to 4) and about 0.08 at the sweep optima (Task 5),
+  as large as some of the effects measured. Task 4 tuned the learning rate on a single seed.
+- **Width 4,096 was not trained.** Its value is extrapolated from 3 widths.
+- **Thresholds are my own choices:** 1% and 10% for "stops mattering", 10% for "the warmup run matches", and a loss
+  above 15 counting as diverged.
+- **Simple muP:** only the hidden-layer learning rate and the output scale change with width.
+- **Not reproduced:** the lesson's 0.281 η step for random gradients and its 100× weight-decay gap. The differences
+  are explained above.
 
 ## A note on compute
 
-While doing this course I once left a Colab runtime connected after a run had finished and lost about 30% of a
-month's credits to an idle GPU. That is a small version of a real failure in LLM training: expensive accelerators
-held by a job that has stopped making progress. So this notebook ends with a cell that releases the runtime
-(`google.colab.runtime.unassign()`) as soon as the last result is printed.
+During this course I once left a Colab runtime connected after a run had finished, and an idle GPU used up about 30%
+of a month's credits. Real LLM training has the same failure on a much larger scale: expensive GPUs held by a job that
+has stopped making progress. So this notebook ends with a cell that releases the runtime as soon as the last result is
+printed.
 
 ## How to run
 
-1. Open [`session11_optimizers.ipynb`](session11_optimizers.ipynb) in Colab (or VS Code connected to a Colab
-   kernel) with a GPU. An A100 runs it in about 22 minutes.
-2. Run all cells. The notebook installs `tiktoken`, writes `model.py`, downloads one TinyStories shard (no HF
-   token needed) and trains every model it reports.
-3. The last cell releases the runtime. In VS Code, save the notebook afterwards to keep the outputs.
-
-Files: `session11_optimizers.ipynb` (all tasks, executed), `model.py` (the model), and the PNG plots extracted from
-the notebook.
+1. Open [`session11_optimizers.ipynb`](session11_optimizers.ipynb) in Colab with a GPU. An A100 runs it in about 22
+   minutes.
+2. Run all cells. The notebook installs `tiktoken`, writes `model.py`, downloads one TinyStories file and trains every
+   model it reports.
+3. The last cell releases the Colab runtime. If you use VS Code, save the notebook afterwards to keep the outputs.
