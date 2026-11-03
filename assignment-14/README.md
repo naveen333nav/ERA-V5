@@ -31,6 +31,9 @@ predictions turned out wrong, and the sections below say which ones.
 - **Hardware:** one Colab **L4** (22 GiB), PyTorch 2.11, no `torch.compile`. The whole notebook runs in about 2 hours.
 
 Notebook: [`session14_moe_upcycling.ipynb`](session14_moe_upcycling.ipynb), executed with every output saved.
+The MoE terms (MaxVio, aux loss vs bias balancing, copy / partition / drop-upcycling, sort-based dropless dispatch,
+capacity and token dropping) are explained with tiny worked examples in
+[`doubts/s14_moe_terms.md`](doubts/s14_moe_terms.md).
 
 ## Results
 
