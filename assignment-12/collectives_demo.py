@@ -1,4 +1,4 @@
-"""Sections 1 and 2: the virtual GPUs say hello, run the three collectives, and time a ring all-reduce.
+"""The virtual GPUs say hello, run the three collectives, and time a ring all-reduce.
 
     torchrun --standalone --nproc_per_node=32 collectives_demo.py --mode hello       --out hello.json
     torchrun --standalone --nproc_per_node=32 collectives_demo.py --mode collectives --out coll.json
