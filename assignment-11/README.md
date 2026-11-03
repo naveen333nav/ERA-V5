@@ -135,7 +135,7 @@ How to read the three panels in each row:
 | Panel | What it shows |
 |---|---|
 | Left: the 20 real gradients | the gradient this weight received at each step |
-| Middle: `|step| / lr` | how far the weight moved at that step, divided by the learning rate. 1 means it moved exactly 0.001; 4 means four times that. Direction is ignored |
+| Middle: `\|step\| / lr` | how far the weight moved at that step, divided by the learning rate. 1 means it moved exactly 0.001; 4 means four times that. Direction is ignored |
 | Right: `weight position w_t − w_0` | where the weight is after t steps, measured from its starting value: the running total of all its steps, with direction |
 
 The red solid line (no correction, β₂ = 0.999) sits 3 to 6 times above the blue line in the middle panels, as the
